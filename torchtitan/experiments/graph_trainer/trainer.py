@@ -31,6 +31,7 @@ from torchtitan.experiments.graph_trainer.passes import (
 from torchtitan.experiments.graph_trainer.registry import (
     PASS_PIPELINE_REGISTRY,
     POST_INIT_HOOKS,
+    POST_TRAIN_HOOKS,
     PRE_TRAIN_STEP_HOOKS,
 )
 from torchtitan.trainer import Trainer
@@ -219,6 +220,12 @@ class GraphTrainer(Trainer):
         super().train_step(data_iterator)
 
     def close(self) -> None:
+        # Give the active pass pipeline one final check before teardown —
+        # e.g. paged_stash's deferred overflow check needs a blocking read
+        # here so an overflow on the last steps still raises (there is no
+        # later pre_train_step hook to observe it).
+        POST_TRAIN_HOOKS.get(self.config.compile.pass_pipeline, lambda _: None)(self)
+
         super().close()
 
         # See Note [explicit cudagraph teardown] in cudagraph.py

@@ -67,8 +67,19 @@ falls back to a pinned host buffer. The pop kernel reads ``spilled_to_host``
 to select the source. CUDA-graph compatible (data-dependent branching).
 
 Level 2 (Hard error): If both CUDA and host buffers are exhausted, the overflow
-flag is set and a RuntimeError is raised at the start of the next step with
-guidance on how to fix (enable spillover, increase buffer, or disable paged stash).
+flag is set (sticky — never cleared once set) and a RuntimeError is raised with
+guidance on how to fix (enable spillover, increase buffer, or disable paged
+stash). The per-step check is non-blocking: the flag is mirrored to pinned host
+memory with an async copy and read one step later, so the CPU never syncs with
+the device at step boundaries (a blocking ``.item()`` here would forfeit CPU
+run-ahead and expose every step's CPU work as a GPU idle bubble). The raise
+therefore lands 2+ steps after the overflow (vs 1 for a blocking check) — up
+to the CPU run-ahead depth, whose replays were already enqueued regardless —
+and a final blocking check at trainer shutdown covers overflows on the last
+steps. Until the raise, affected steps produce degenerate gradients (the copy
+kernel no-ops and pops return zeros), same class of behavior as the blocking
+check's one late step; the raise is rank-local (only overflowing ranks raise;
+peers exit via process-group timeout / torchrun teardown).
 
 Configuration
 -------------
@@ -119,6 +130,7 @@ page_record format: ``[num_tokens, spilled_to_host, page_id_0, page_id_1, ...]``
 
 import functools
 import operator
+import sys
 from dataclasses import dataclass
 
 import torch
@@ -150,6 +162,7 @@ from .registry import (
     register_memory_policy,
     register_pass_pipeline,
     register_post_init_hook,
+    register_post_train_hook,
     register_pre_train_step_hook,
 )
 
@@ -197,32 +210,97 @@ class PagedStash(Configurable):
             host_buffer_size_factor=config.host_buffer_size_factor,
             buffer_device=device,
         )
+        self._init_overflow_check_state()
+
+    def _init_overflow_check_state(self):
+        """State for the non-blocking overflow check (see check_overflow):
+        a pinned host mirror of the overflow flag, an event marking when the
+        most recent async copy into it completed, and whether a copy is in
+        flight. Pre-allocated so the per-step path allocates nothing.
+        (Separate from __init__ so unit tests can build the check state
+        around a bare overflow tensor without a model.)
+        """
+        self._overflow_host = None
+        self._overflow_event = None
+        self._overflow_pending = False
+        if self.overflow is not None:
+            self._overflow_host = torch.zeros(
+                self.overflow.shape,
+                dtype=self.overflow.dtype,
+                device="cpu",
+                pin_memory=True,
+            )
+            self._overflow_event = torch.cuda.Event()
 
     def reset(self):
-        """Reset all buffers and flags for the next step. CUDA graph safe."""
+        """Reset all buffers and flags for the next step. CUDA graph safe.
+
+        The overflow flag is deliberately NOT cleared: it is sticky so a
+        transient overflow cannot be overwritten before the deferred check in
+        ``check_overflow`` observes it, no matter how far the CPU runs ahead
+        of the GPU. Overflow is fatal (RuntimeError), so there is no recovery
+        path that would need the flag cleared.
+        """
         if self.buffers:
             for buf in self.buffers.values():
                 buf.reset()
-        if self.overflow is not None:
-            self.overflow.zero_()
         if self.host_spill is not None:
             self.host_spill.zero_()
 
     def check_overflow(self):
-        """Raise RuntimeError if the previous step overflowed."""
+        """Raise RuntimeError if a recent step overflowed. Never blocks.
+
+        Reading the device flag with ``Tensor.item()`` would synchronize the
+        CPU with the GPU at every step boundary, forfeiting CPU run-ahead and
+        exposing each step's CPU work as a GPU idle bubble. Instead, read the
+        pinned host mirror filled by the async copy enqueued on a previous
+        call (guarded by its event), then enqueue a fresh copy of the current
+        flag. Because the flag is sticky (see ``reset``), an overflow at step
+        N is observed at a later hook — typically step N+2 (the blocking
+        version already reported one step late), later if the CPU is running
+        further ahead (those steps' replays were already enqueued anyway) —
+        or, for an overflow on the final steps where no later hook runs, by
+        ``check_overflow_blocking`` at trainer shutdown. Note the raise is
+        rank-local: only ranks whose routing overflowed raise; peers block in
+        the next collective until the process group times out / torchrun
+        tears the job down.
+        """
+        if self.overflow is None:
+            return
+        if self._overflow_pending and self._overflow_event.query():
+            self._overflow_pending = False
+            if self._overflow_host.item() != 0:
+                self._raise_overflow()
+        self._overflow_host.copy_(self.overflow, non_blocking=True)
+        self._overflow_event.record()
+        self._overflow_pending = True
+
+    def check_overflow_blocking(self):
+        """Blocking overflow check for trainer shutdown.
+
+        The deferred ``check_overflow`` needs a later hook invocation to
+        observe an overflow, so an overflow on the last 1 + run-ahead steps
+        would otherwise escape and the job would exit cleanly (with its final
+        checkpoint). One synchronizing read at shutdown closes that window at
+        zero per-step cost.
+        """
         if self.overflow is not None and self.overflow.item() != 0:
-            raise RuntimeError(
-                "Paged stash buffer overflow detected. "
-                "The CUDA paged stash buffer is too small for the current "
-                "routing pattern.\n\n"
-                "To fix, try one of:\n"
-                "  1. Enable host spillover: "
-                "--compile.paged_stash.host_buffer_size_factor 1.0\n"
-                "  2. Increase buffer size: "
-                "--compile.paged_stash.buffer_size_factor 2.0\n"
-                "  3. Disable paged stash: "
-                "--compile.memory_policy default"
-            )
+            self._raise_overflow()
+
+    @staticmethod
+    def _raise_overflow():
+        raise RuntimeError(
+            "Paged stash buffer overflow detected. "
+            "The CUDA paged stash buffer is too small for the current "
+            "routing pattern.\n\n"
+            "To fix, try one of:\n"
+            "  1. Enable host spillover: "
+            "--compile.paged_stash.host_buffer_size_factor 1.0\n"
+            "  2. Increase buffer size: "
+            "--compile.paged_stash.buffer_size_factor 2.0\n"
+            "  3. Disable paged stash: "
+            "--compile.memory_policy default"
+        )
 
     @property
     def buffers_dict(self) -> dict | None:
@@ -1508,8 +1586,22 @@ def setup_paged_stash_buffers(trainer):
 
 @register_pre_train_step_hook("paged_stash")
 def reset_paged_stash_buffers(trainer):
-    """Check previous step's overflow flag, then reset buffers for this step."""
+    """Check the overflow flag (non-blocking), then reset buffers for this step."""
     paged_stash = getattr(trainer, "_paged_stash", None)
     if paged_stash is not None:
         paged_stash.check_overflow()
         paged_stash.reset()
+
+
+@register_post_train_hook("paged_stash")
+def final_overflow_check(trainer):
+    """Blocking overflow check at shutdown, so an overflow on the final steps
+    (where no later pre_train_step hook runs) still fails the job instead of
+    exiting cleanly with a checkpoint that absorbed degenerate gradients."""
+    if sys.exc_info()[0] is not None:
+        # close() runs in a `finally`; if training is already failing, don't
+        # mask the original exception with the overflow raise.
+        return
+    paged_stash = getattr(trainer, "_paged_stash", None)
+    if paged_stash is not None:
+        paged_stash.check_overflow_blocking()
