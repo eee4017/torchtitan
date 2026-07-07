@@ -142,13 +142,15 @@ from torchtitan.experiments.graph_trainer.cpu_offload import _classify_forward_b
 from torchtitan.tools.logging import logger
 
 from .passes import (
-    apply_sac_pass,
     construct_default_graph_passes,
+    selective_activation_remat_pass,
+    tag_sac_policy as apply_sac_pass,
+)
+from .registry import (
     register_memory_policy,
     register_pass_pipeline,
     register_post_init_hook,
     register_pre_train_step_hook,
-    selective_activation_remat_pass,
 )
 
 
